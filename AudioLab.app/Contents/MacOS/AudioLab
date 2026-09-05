@@ -1,0 +1,4 @@
+#!/bin/zsh
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$ROOT"
+exec "$ROOT/.venv/bin/python" "$ROOT/desktop_app.py"
