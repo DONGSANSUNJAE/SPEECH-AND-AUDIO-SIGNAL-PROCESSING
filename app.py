@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import librosa
 import numpy as np
 import plotly.graph_objects as go
@@ -14,14 +16,17 @@ from audio_core import (
     VOICES,
     AudioClip,
     analyze,
+    classify_segments,
     download_sample,
     download_url,
     list_downloads,
     load_audio_bytes,
     load_audio_file,
     make_demo,
+    resample_clip,
     synthesize_speech,
     to_wav_bytes,
+    transcribe,
 )
 
 INK = "#1C1916"
@@ -214,6 +219,77 @@ def plotly_pitch(clip: AudioClip, hop: int) -> go.Figure:
     return fig
 
 
+SEGMENT_COLORS = {0: "#C9BFAE", 1: "#C97A3B", 2: "#1B3A6B"}
+
+
+def plotly_segments(clip: AudioClip, segments: list) -> go.Figure:
+    fig = _chart("파형 + 자동 분류 구간", 300, 0.0, max(clip.duration, 0.05))
+    for seg in segments:
+        fig.add_vrect(
+            x0=seg.start, x1=seg.end,
+            fillcolor=SEGMENT_COLORS.get(seg.code, "#CCCCCC"), opacity=0.28, line_width=0,
+        )
+    fig.add_scatter(
+        x=np.arange(len(clip.y)) / clip.sr,
+        y=clip.y,
+        mode="lines",
+        line=dict(color=INK, width=1.0),
+        hovertemplate="%{x:.3f}초 · 진폭 %{y:.3f}<extra></extra>",
+    )
+    fig.update_yaxes(title="진폭")
+    fig.update_layout(showlegend=False)
+    return fig
+
+
+def plotly_energy_zcr(times: np.ndarray, diag: dict) -> go.Figure:
+    t0 = float(times[0]) if len(times) else 0.0
+    t1 = float(times[-1]) if len(times) else 0.05
+    fig = _chart("프레임별 에너지(RMS) · ZCR", 280, t0, t1)
+    fig.add_scatter(
+        x=times, y=diag["rms_db"], mode="lines", name="에너지 (dB)",
+        line=dict(color=NAVY, width=1.4),
+        hovertemplate="%{x:.3f}초 · 에너지 %{y:.1f} dB<extra></extra>",
+    )
+    fig.add_hline(
+        y=diag["threshold_db"],
+        line=dict(color="#A8481C", width=1.2, dash="dash"),
+        annotation_text=f"발화 판정 임계값 {diag['threshold_db']:.1f} dB",
+        annotation_position="top left",
+        annotation_font=dict(size=11, color="#A8481C"),
+    )
+    fig.add_scatter(
+        x=times, y=diag["zcr"], mode="lines", name="ZCR", yaxis="y2",
+        line=dict(color="#C97A3B", width=1.0),
+        hovertemplate="%{x:.3f}초 · ZCR %{y:.3f}<extra></extra>",
+    )
+    zcr_max = float(np.max(diag["zcr"])) if len(diag["zcr"]) else 0.5
+    fig.update_layout(
+        yaxis=dict(title="에너지 (dB)", gridcolor=LINE, zeroline=False),
+        yaxis2=dict(title="ZCR", overlaying="y", side="right", range=[0, max(0.5, zcr_max * 1.1)], showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+def plotly_spectrum_compare(entries: list[tuple[str, AudioClip, str]]) -> go.Figure:
+    fig = _chart("스펙트럼 비교", 340, 0, 1)
+    fig.update_layout(xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    max_sr = max(clip.sr for _, clip, _ in entries)
+    for label, clip, color in entries:
+        n = len(clip.y)
+        mag = 20 * np.log10(np.maximum(np.abs(np.fft.rfft(clip.y * np.hanning(n))), 1e-12))
+        mag -= np.max(mag)
+        freqs = np.fft.rfftfreq(n, d=1 / clip.sr)
+        fig.add_scatter(
+            x=freqs, y=mag, mode="lines", name=label,
+            line=dict(color=color, width=1.4),
+            hovertemplate=f"{label} · " + "%{x:.0f} Hz · %{y:.1f} dB<extra></extra>",
+        )
+    fig.update_xaxes(title="주파수 (Hz)", range=[0, max_sr / 2])
+    fig.update_yaxes(title="크기 (dB)", range=[-80, 3])
+    return fig
+
+
 def pick_clip():
     mode = st.selectbox(
         "방법",
@@ -309,6 +385,36 @@ def main() -> None:
     st.audio(to_wav_bytes(clip), format="audio/wav")
     st.markdown("</div>", unsafe_allow_html=True)
 
+    st.markdown('<div class="section"><h3>음성 인식 (STT, 로컬 Whisper)</h3>', unsafe_allow_html=True)
+    model_size = st.selectbox(
+        "모델 크기", ["tiny", "base", "small"], index=1,
+        help="크기가 클수록 정확하지만 느립니다. 모델은 처음 고를 때 한 번만 내려받습니다.",
+    )
+    if st.button("텍스트로 변환", width="stretch"):
+        with st.spinner("음성을 텍스트로 변환하는 중입니다 (처음이면 모델 다운로드도 함께 진행돼 더 걸릴 수 있어요)."):
+            st.session_state.transcript = transcribe(clip, model_size)
+            st.session_state.transcript_key = clip.name
+    result = st.session_state.get("transcript")
+    if result and st.session_state.get("transcript_key") == clip.name:
+        st.caption(f"인식된 언어: {result['language']} (신뢰도 {result['language_probability'] * 100:.0f}%)")
+        st.text_area("인식 결과", result["text"], height=100)
+        if result["segments"]:
+            seg_rows = "".join(
+                f"<tr><td>{s:.2f} ~ {e:.2f} 초</td><td>{t}</td></tr>" for s, e, t in result["segments"]
+            )
+            st.markdown(
+                f'<table class="stats"><tr><th>구간</th><th>내용</th></tr>{seg_rows}</table>',
+                unsafe_allow_html=True,
+            )
+        st.download_button(
+            "인식 결과 텍스트로 저장",
+            data=result["text"],
+            file_name=f"{Path(clip.name).stem}_transcript.txt",
+            mime="text/plain",
+            width="stretch",
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
     fmax_plot = min(fmax, clip.sr // 2)
     duration = max(float(clip.duration), 0.05)
     st.markdown('<div class="section"><h3>파형 · 스펙트로그램</h3>', unsafe_allow_html=True)
@@ -322,18 +428,81 @@ def main() -> None:
     if y1 - y0 < 20:
         y1 = min(float(fmax_plot), y0 + 20)
 
-    st.plotly_chart(plotly_waveform(clip, t0, t1), width="stretch", config=CHART_CONFIG)
-    st.plotly_chart(plotly_mel(clip, n_fft, hop, n_mels, fmin, fmax, t0, t1, y0, y1), width="stretch", config=CHART_CONFIG)
+    st.plotly_chart(plotly_waveform(clip, t0, t1), use_container_width=True, config=CHART_CONFIG)
+    st.plotly_chart(plotly_mel(clip, n_fft, hop, n_mels, fmin, fmax, t0, t1, y0, y1), use_container_width=True, config=CHART_CONFIG)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="section"><h3>스펙트럼 · 음높이</h3>', unsafe_allow_html=True)
     tab_stft, tab_spec, tab_pitch = st.tabs(["선형 스펙트로그램", "평균 스펙트럼", "음높이"])
     with tab_stft:
-        st.plotly_chart(plotly_stft(clip, n_fft, hop, t0, t1, y0, y1), width="stretch", config=CHART_CONFIG)
+        st.plotly_chart(plotly_stft(clip, n_fft, hop, t0, t1, y0, y1), use_container_width=True, config=CHART_CONFIG)
     with tab_spec:
-        st.plotly_chart(plotly_spectrum(clip), width="stretch", config=CHART_CONFIG)
+        st.plotly_chart(plotly_spectrum(clip), use_container_width=True, config=CHART_CONFIG)
     with tab_pitch:
-        st.plotly_chart(plotly_pitch(clip, hop), width="stretch", config=CHART_CONFIG)
+        st.plotly_chart(plotly_pitch(clip, hop), use_container_width=True, config=CHART_CONFIG)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section"><h3>샘플레이트 비교 (다운샘플링)</h3>', unsafe_allow_html=True)
+    st.caption(f"원본 샘플레이트: {clip.sr:,} Hz. 아래에서 16 kHz / 8 kHz / 2 kHz로 낮췄을 때 소리와 대역폭이 어떻게 달라지는지 들어 보세요.")
+    targets = [t for t in (16000, 8000, 2000) if t < clip.sr] or [clip.sr]
+    downs = {target: resample_clip(clip, target) for target in targets}
+    compare_colors = {16000: NAVY, 8000: "#C97A3B", 2000: "#A8481C"}
+    entries = [("원본", clip, MUTED)] + [
+        (f"{target:,} Hz", downs[target], compare_colors.get(target, INK)) for target in targets
+    ]
+    st.plotly_chart(plotly_spectrum_compare(entries), use_container_width=True, config=CHART_CONFIG)
+    st.caption("한 그래프에 겹쳐 그린 스펙트럼입니다 — 각 선이 자기 나이퀴스트 주파수에서 뚝 끊기는 걸 한눈에 볼 수 있어요.")
+
+    cols = st.columns(len(targets))
+    notes = {
+        16000: "8 kHz까지의 대역을 보존합니다. 대부분의 자음·마찰음 정보가 남아 원음과 큰 차이를 느끼기 어렵습니다.",
+        8000: "4 kHz까지만 남습니다. 전화 음질과 비슷하며, 치찰음(s, sh)의 고역이 다소 뭉개집니다.",
+        2000: "1 kHz까지만 남아 대부분의 마찰음·파열음 단서가 사라집니다. 모음은 들리지만 자음 구분이 어려워 알아듣기 힘들어집니다.",
+    }
+    for col, target in zip(cols, targets):
+        with col:
+            down = downs[target]
+            st.markdown(f"**{target:,} Hz** (나이퀴스트 {target // 2:,} Hz)")
+            # Browsers refuse to play very low sample-rate WAVs (e.g. 2 kHz), so
+            # upsample only the playback copy; no information is added back.
+            playable = resample_clip(down, 8000) if down.sr < 8000 else down
+            st.audio(to_wav_bytes(playable), format="audio/wav")
+            st.plotly_chart(plotly_waveform(down, 0.0, max(down.duration, 0.05)), use_container_width=True, config=CHART_CONFIG)
+            st.caption(notes.get(target, ""))
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section"><h3>발화 구간 자동 분류 (voiced / unvoiced / background)</h3>', unsafe_allow_html=True)
+    with st.expander("분류 기준 설정", expanded=False):
+        energy_margin = st.slider("에너지 임계값 여유 (dB, 잡음 바닥 대비)", 3.0, 30.0, 12.0, 1.0)
+        zcr_th = st.slider("무성음 판정 ZCR 임계값", 0.02, 0.3, 0.12, 0.01)
+    times_c, _, segments, diag = classify_segments(clip, energy_margin_db=energy_margin, zcr_threshold=zcr_th)
+    st.plotly_chart(plotly_energy_zcr(times_c, diag), use_container_width=True, config=CHART_CONFIG)
+    st.caption(
+        f"분석 프레임 {diag['frame_ms']:.0f}ms, 이동 간격(hop) {diag['hop_ms']:.0f}ms → 프레임끼리 "
+        f"{diag['overlap_pct']:.0f}% 겹쳐서(overlap) 짧은 구간마다 에너지·ZCR을 계산합니다. "
+        f"잡음 바닥은 {diag['noise_floor_db']:.1f} dB로 추정, 위 설정의 여유값을 더해 임계값을 정합니다."
+    )
+    st.plotly_chart(plotly_segments(clip, segments), use_container_width=True, config=CHART_CONFIG)
+    rows = "".join(
+        f"<tr><td>{seg.start:.2f} ~ {seg.end:.2f} 초</td><td>{seg.label}</td></tr>" for seg in segments
+    )
+    st.markdown(
+        f'<table class="stats"><tr><th>구간</th><th>분류</th></tr>{rows}</table>',
+        unsafe_allow_html=True,
+    )
+    label_en = {0: "background", 1: "unvoiced", 2: "voiced"}
+    report_lines = [f"{seg.start:.2f} ~ {seg.end:.2f} sec: {label_en[seg.code]}" for seg in segments]
+    st.download_button(
+        "분류 결과 텍스트로 저장",
+        data="\n".join(report_lines),
+        file_name=f"{Path(clip.name).stem}_segments.txt",
+        mime="text/plain",
+        width="stretch",
+    )
+    st.caption(
+        "에너지(RMS)가 잡음 바닥보다 충분히 높으면 발화 구간으로, 그중 피치(YIN)가 검출되거나 ZCR이 낮으면 유성음, "
+        "그렇지 않으면 무성음으로 분류하는 간단한 규칙 기반 방법입니다. 위 설정을 조정해 경계를 다시 확인해 보세요."
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
 

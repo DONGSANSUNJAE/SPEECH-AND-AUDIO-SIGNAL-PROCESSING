@@ -11,9 +11,16 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # Packaged by PyInstaller as AudioLab.app, living directly in the project
+    # folder: .../Audio/AudioLab.app/Contents/MacOS/AudioLab
+    ROOT = Path(sys.executable).resolve().parents[3]
+else:
+    ROOT = Path(__file__).resolve().parent
+
 PORT = 8510
 URL = f"http://127.0.0.1:{PORT}"
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 
 
 def _port_open() -> bool:
@@ -41,7 +48,7 @@ def _start_server() -> subprocess.Popen[bytes] | None:
         return None
     proc = subprocess.Popen(
         [
-            sys.executable,
+            str(VENV_PYTHON),
             "-m",
             "streamlit",
             "run",

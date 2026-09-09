@@ -4,6 +4,9 @@ __pycache__/
 .DS_Store
 downloads/
 archive/
+build/
+dist/
+AudioLab.app/
 *.mp3
 *.wav
 !demo_*.wav

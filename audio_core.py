@@ -368,6 +368,126 @@ def plot_mfcc(clip: AudioClip, n_fft: int, hop: int, n_mels: int) -> Figure:
     return fig
 
 
+def resample_clip(clip: AudioClip, target_sr: int) -> AudioClip:
+    if target_sr == clip.sr:
+        y = clip.y.copy()
+    else:
+        y = librosa.resample(clip.y, orig_sr=clip.sr, target_sr=target_sr)
+    stem = Path(clip.name).stem
+    return AudioClip(y=y.astype(np.float32), sr=target_sr, name=f"{stem}_{target_sr}hz.wav", channels=1)
+
+
+@dataclass
+class Segment:
+    start: float
+    end: float
+    label: str
+    code: int
+
+
+_LABEL_KO = {0: "배경(background)", 1: "무성음(unvoiced)", 2: "유성음(voiced)"}
+
+
+def _frames_to_segments(times: np.ndarray, labels: np.ndarray, hop_s: float, min_dur: float) -> list[Segment]:
+    if len(labels) == 0:
+        return []
+    raw: list[Segment] = []
+    start_idx = 0
+    for i in range(1, len(labels) + 1):
+        if i == len(labels) or labels[i] != labels[start_idx]:
+            start_t = max(0.0, times[start_idx] - hop_s / 2)
+            end_t = times[i - 1] + hop_s / 2
+            raw.append(Segment(start=start_t, end=end_t, label=_LABEL_KO[labels[start_idx]], code=int(labels[start_idx])))
+            start_idx = i
+    merged: list[Segment] = []
+    for seg in raw:
+        if merged and (seg.end - seg.start) < min_dur:
+            prev = merged[-1]
+            merged[-1] = Segment(start=prev.start, end=seg.end, label=prev.label, code=prev.code)
+        else:
+            merged.append(seg)
+    return merged
+
+
+def classify_segments(
+    clip: AudioClip,
+    frame_ms: float = 25.0,
+    hop_ms: float = 10.0,
+    energy_margin_db: float = 12.0,
+    zcr_threshold: float = 0.12,
+    min_segment_ms: float = 30.0,
+) -> tuple[np.ndarray, np.ndarray, list[Segment], dict]:
+    """Heuristic background(0)/unvoiced(1)/voiced(2) classifier.
+
+    Background: short-time energy near the estimated noise floor (10th percentile).
+    Voiced: energy above the floor, with either a reliable YIN pitch or low ZCR.
+    Unvoiced: energy above the floor but high ZCR and no reliable pitch (fricatives/stops).
+
+    Returns (times, labels, segments, diagnostics) — diagnostics carries the
+    frame-level RMS(dB)/ZCR curves plus the threshold and framing (frame/hop
+    length, overlap %) used, for plotting alongside the classification.
+    """
+    sr = clip.sr
+    frame_length = max(int(sr * frame_ms / 1000), 32)
+    hop_length = max(int(sr * hop_ms / 1000), 16)
+
+    rms = librosa.feature.rms(y=clip.y, frame_length=frame_length, hop_length=hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(clip.y, frame_length=frame_length, hop_length=hop_length)[0]
+    times = librosa.times_like(rms, sr=sr, hop_length=hop_length)
+
+    rms_db = 20 * np.log10(np.maximum(rms, 1e-9))
+    noise_floor_db = float(np.percentile(rms_db, 10))
+    energy_threshold_db = noise_floor_db + energy_margin_db
+
+    f0, voiced_flag, _ = librosa.pyin(
+        clip.y, fmin=65, fmax=400, sr=sr, frame_length=frame_length * 4, hop_length=hop_length
+    )
+    voiced_pitch = voiced_flag[: len(times)] & np.isfinite(f0[: len(times)])
+
+    labels = np.zeros(len(times), dtype=int)
+    active = rms_db > energy_threshold_db
+    labels[active] = 1
+    labels[active & (voiced_pitch | (zcr < zcr_threshold))] = 2
+
+    if len(labels) >= 3:
+        labels = sp_signal.medfilt(labels, kernel_size=3).astype(int)
+
+    segments = _frames_to_segments(times, labels, hop_ms / 1000, min_segment_ms / 1000)
+    diagnostics = {
+        "rms_db": rms_db,
+        "zcr": zcr,
+        "threshold_db": energy_threshold_db,
+        "noise_floor_db": noise_floor_db,
+        "frame_ms": frame_ms,
+        "hop_ms": hop_ms,
+        "overlap_pct": max(0.0, (1 - hop_ms / frame_ms) * 100),
+    }
+    return times, labels, segments, diagnostics
+
+
+_ASR_MODELS: dict[str, object] = {}
+
+
+def transcribe(clip: AudioClip, model_size: str = "base") -> dict:
+    """Transcribe a clip locally with faster-whisper (no API key, runs on CPU)."""
+    from faster_whisper import WhisperModel
+
+    model = _ASR_MODELS.get(model_size)
+    if model is None:
+        model = WhisperModel(model_size, device="cpu", compute_type="int8", download_root=str(_CACHE / "whisper"))
+        _ASR_MODELS[model_size] = model
+
+    y16k = clip.y if clip.sr == 16000 else librosa.resample(clip.y, orig_sr=clip.sr, target_sr=16000)
+    raw_segments, info = model.transcribe(y16k.astype(np.float32), beam_size=5)
+    segments = [(float(s.start), float(s.end), s.text.strip()) for s in raw_segments]
+    return {
+        "text": " ".join(s[2] for s in segments).strip(),
+        "language": info.language,
+        "language_probability": float(info.language_probability),
+        "segments": segments,
+    }
+
+
 def to_wav_bytes(clip: AudioClip) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, clip.y, clip.sr, format="WAV")

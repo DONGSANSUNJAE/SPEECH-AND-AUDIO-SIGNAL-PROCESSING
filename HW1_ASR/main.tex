@@ -1,0 +1,71 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{Automatic Speech Recognition: A Brief History and Recent Trends}
+
+\author{\IEEEauthorblockN{Howon Chung}
+\IEEEauthorblockA{\textit{Department of Electrical and Electronic Engineering} \\
+\textit{Yonsei University}\\
+Seoul, South Korea \\
+zeroshot@yonsei.ac.kr}
+}
+
+\maketitle
+
+\begin{abstract}
+Automatic speech recognition (ASR) has evolved through several technical eras over seven decades: template matching, statistical HMM/GMM modeling, hybrid DNN-HMM acoustic models, fully end-to-end neural architectures, and today's self-supervised and weakly supervised foundation models. Since 2023, ASR has increasingly fused with large language models into unified, real-time multimodal systems. This report traces that history and surveys these recent trends.
+\end{abstract}
+
+\begin{IEEEkeywords}
+automatic speech recognition, hidden Markov models, deep neural networks, end-to-end speech recognition, self-supervised learning, foundation models
+\end{IEEEkeywords}
+
+\section{Introduction}
+Automatic speech recognition (ASR), the conversion of spoken audio into text, underlies dictation, voice assistants, captioning, and speech translation. Its dominant paradigm has shifted repeatedly, from template matching to statistical, hybrid, end-to-end, and foundation-model approaches. Section II traces this history (Table~\ref{tab1}); Section III surveys current trends.
+
+\section{Historical Development}
+The earliest ASR systems recognized small, speaker-dependent vocabularies via template matching. Bell Labs' \emph{Audrey} \cite{b1} used vowel formants to recognize digits at $\sim$97--99\% accuracy for one talker, and Itakura later combined linear predictive coding with dynamic time warping for isolated-word recognition (1975). ARPA's Speech Understanding Research program (1971--1976) targeted connected speech: CMU's \emph{Harpy} exceeded its 90\%-accuracy goal via finite-state beam search, while \emph{Hearsay-II} introduced the ``blackboard'' architecture.
+
+From the 1980s, ASR converged on HMMs with GMM emissions, trained via Baum-Welch/Viterbi; IBM's \emph{Tangora} and CMU's \emph{Sphinx} demonstrated large-vocabulary and speaker-independent recognition. Shared corpora (TIMIT, Wall Street Journal, Switchboard) enabled benchmarking, while discriminative training (MMI, MPE) pushed Switchboard WER from $\sim$43\% (1995) to 15--25\% by the mid-2000s, GMM-HMM's practical ceiling.
+
+\begin{table}[t]
+\caption{Eras of Automatic Speech Recognition}
+\label{tab1}
+\centering
+\footnotesize
+\begin{tabular}{|p{0.20\linewidth}|p{0.09\linewidth}|p{0.57\linewidth}|}
+\hline
+\textbf{Era} & \textbf{Years} & \textbf{Key Method / System} \\
+\hline
+Template matching & 1950s--76 & Formant/DTW; Audrey, Harpy \\
+Statistical GMM-HMM & 1980s--2000s & HMM+GMM, n-gram LM; Sphinx, HTK \\
+Hybrid DNN-HMM & 2009--13 & CD-DNN-HMM; Bing, Google Voice \\
+End-to-end neural & 2014--20 & CTC, RNN-T, Conformer \\
+Foundation era & 2019--26 & Self-sup. pretraining, audio LLMs; Whisper, GPT-4o \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{Recent Trends}
+Neural acoustic models re-entered ASR when DNN-HMM systems outperformed GMM-HMM baselines, cutting Switchboard WER from 27.4\% to 18.5\% and enabling industrial deployment by 2012. Connectionist Temporal Classification then enabled training directly on unsegmented audio-label pairs; attention-based seq2seq models, the RNN-Transducer, and the Conformer followed, replacing separately trained acoustic, pronunciation, and language models with one end-to-end network.
+
+Since 2019, self-supervised pretraining on unlabeled audio (wav2vec 2.0, HuBERT, WavLM) has cut labeled-data needs, while Whisper \cite{b12} (680{,}000 hours of weak multilingual supervision) generalizes zero-shot across noise and accents. Massively multilingual and distilled variants now extend coverage and enable on-device streaming. Most recently, audio-native LLMs (GPT-4o, Gemini, Moshi) fuse recognition directly with generation, removing cascaded ASR-LLM-TTS latency, while parallel work targets atypical-speech robustness and semantic evaluation beyond raw WER.
+
+\section{Conclusion}
+ASR has progressed from template matching through statistical, hybrid, and end-to-end architectures to today's self-supervised, multimodal foundation models, and is now converging toward multilingual, streaming, LLM-integrated spoken-language understanding.
+
+\footnotesize
+\begin{thebibliography}{00}
+\bibitem{b1} K. H. Davis, R. Biddulph, and S. Balashek, ``Automatic recognition of spoken digits,'' \emph{J. Acoust. Soc. Am.}, vol. 24, no. 6, pp. 637--642, 1952.
+\bibitem{b12} A. Radford \emph{et al.}, ``Robust speech recognition via large-scale weak supervision,'' \emph{arXiv:2212.04356}, 2022.
+\end{thebibliography}
+
+\end{document}
