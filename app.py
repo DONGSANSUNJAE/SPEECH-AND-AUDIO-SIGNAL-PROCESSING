@@ -290,6 +290,25 @@ def plotly_spectrum_compare(entries: list[tuple[str, AudioClip, str]]) -> go.Fig
     return fig
 
 
+def plotly_spectrogram_fixed(clip: AudioClip, freq_range: float, title: str, height: int = 220) -> go.Figure:
+    """Linear STFT spectrogram with a fixed frequency range/color scale so several
+    sample rates can be compared side by side on identical axes."""
+    n_fft = 1024
+    hop = 128
+    S = librosa.amplitude_to_db(np.abs(librosa.stft(clip.y, n_fft=n_fft, hop_length=hop)), ref=np.max)
+    times = librosa.times_like(S, sr=clip.sr, hop_length=hop)
+    freqs = librosa.fft_frequencies(sr=clip.sr, n_fft=n_fft)
+    fig = _chart(title, height, 0.0, max(clip.duration, 0.05))
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.add_heatmap(
+        z=S, x=times, y=freqs, zmin=-80, zmax=0, colorscale="Hot",
+        colorbar=dict(title="dB", thickness=10),
+        hovertemplate="%{x:.3f}초 · %{y:.0f} Hz · %{z:.1f} dB<extra></extra>",
+    )
+    fig.update_yaxes(title="주파수 (Hz)", range=[0, freq_range])
+    return fig
+
+
 def pick_clip():
     mode = st.selectbox(
         "방법",
@@ -451,7 +470,8 @@ def main() -> None:
         (f"{target:,} Hz", downs[target], compare_colors.get(target, INK)) for target in targets
     ]
     st.plotly_chart(plotly_spectrum_compare(entries), use_container_width=True, config=CHART_CONFIG)
-    st.caption("한 그래프에 겹쳐 그린 스펙트럼입니다 — 각 선이 자기 나이퀴스트 주파수에서 뚝 끊기는 걸 한눈에 볼 수 있어요.")
+    st.caption("한 그래프에 겹쳐 그린 스펙트럼입니다 — 각 선이 자기 나이퀴스트 주파수에서 뚝 끊기는 걸 한눈에 볼 수 있어요. "
+               "아래 카드들의 스펙트로그램도 모두 같은 주파수 축(0~원본 나이퀴스트)과 같은 색 기준으로 그려서, 대역이 잘려나가는 지점을 서로 비교할 수 있습니다.")
 
     cols = st.columns(len(targets))
     notes = {
@@ -467,7 +487,11 @@ def main() -> None:
             # upsample only the playback copy; no information is added back.
             playable = resample_clip(down, 8000) if down.sr < 8000 else down
             st.audio(to_wav_bytes(playable), format="audio/wav")
-            st.plotly_chart(plotly_waveform(down, 0.0, max(down.duration, 0.05)), use_container_width=True, config=CHART_CONFIG)
+            spec_title = f"스펙트로그램 ({target:,} Hz, 0-{clip.sr // 2:,} Hz 축 고정)"
+            st.plotly_chart(
+                plotly_spectrogram_fixed(down, freq_range=clip.sr / 2, title=spec_title, height=260),
+                use_container_width=True, config=CHART_CONFIG,
+            )
             st.caption(notes.get(target, ""))
     st.markdown("</div>", unsafe_allow_html=True)
 
