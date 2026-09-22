@@ -34,10 +34,10 @@ DOWNLOADS.mkdir(exist_ok=True)
 CMAP = "magma"
 
 VOICES = [
-    ("한국어 · 선희 (여)", "ko-KR-SunHiNeural"),
-    ("한국어 · 인준 (남)", "ko-KR-InJoonNeural"),
-    ("English · Jenny", "en-US-JennyNeural"),
-    ("English · Guy", "en-US-GuyNeural"),
+    ("한국어 · 여자", "ko-KR-SunHiNeural"),
+    ("한국어 · 남자", "ko-KR-InJoonNeural"),
+    ("English · Woman", "en-US-JennyNeural"),
+    ("English · Man", "en-US-GuyNeural"),
 ]
 
 SAMPLES = [
@@ -406,7 +406,16 @@ def _frames_to_segments(times: np.ndarray, labels: np.ndarray, hop_s: float, min
             merged[-1] = Segment(start=prev.start, end=seg.end, label=prev.label, code=prev.code)
         else:
             merged.append(seg)
-    return merged
+    # Swallowing a short blip above can leave two same-label segments
+    # adjacent to each other; coalesce those into one.
+    coalesced: list[Segment] = []
+    for seg in merged:
+        if coalesced and coalesced[-1].code == seg.code:
+            prev = coalesced[-1]
+            coalesced[-1] = Segment(start=prev.start, end=seg.end, label=prev.label, code=prev.code)
+        else:
+            coalesced.append(seg)
+    return coalesced
 
 
 def classify_segments(
@@ -567,3 +576,255 @@ def plotly_stft(clip: AudioClip, n_fft: int, hop: int, t0: float, t1: float, y0:
     )
     fig.update_yaxes(title="Frequency (Hz)", range=[y0, y1])
     return fig
+
+
+# ---------------------------------------------------------------------------
+# HW3: short-time framing / OLA, pitch estimation (autocorrelation & AMDF), VAD
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FrameSet:
+    frames: np.ndarray  # (n_frames, frame_length), windowed
+    window: np.ndarray  # (frame_length,)
+    frame_length: int
+    hop_length: int
+    sr: int
+
+
+def frame_signal(clip: AudioClip, frame_ms: float = 20.0, overlap_pct: float = 50.0, window: str = "hamming") -> FrameSet:
+    """Split a clip into short-time, windowed, overlapping frames."""
+    sr = clip.sr
+    frame_length = max(int(round(sr * frame_ms / 1000)), 2)
+    hop_length = max(int(round(frame_length * (1 - overlap_pct / 100))), 1)
+    win = sp_signal.get_window(window, frame_length, fftbins=True).astype(np.float32)
+    y = clip.y
+    n_frames = 1 + max(0, (len(y) - frame_length) // hop_length)
+    if n_frames <= 0:
+        frames = np.zeros((0, frame_length), dtype=np.float32)
+    else:
+        frames = np.stack([y[i * hop_length: i * hop_length + frame_length] * win for i in range(n_frames)])
+    return FrameSet(frames=frames, window=win, frame_length=frame_length, hop_length=hop_length, sr=sr)
+
+
+def ola_reconstruct(fs: FrameSet, weighted: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Overlap-and-add reconstruction. weighted=True normalizes by the summed
+    window envelope (weighted OLA), which compensates the amplitude ripple a
+    window that doesn't satisfy the constant-overlap-add (COLA) constraint
+    introduces (e.g. Hamming at 50% overlap, unlike Hanning)."""
+    n_frames = len(fs.frames)
+    output_len = fs.hop_length * (n_frames - 1) + fs.frame_length if n_frames else 0
+    y = np.zeros(output_len, dtype=np.float64)
+    wsum = np.zeros(output_len, dtype=np.float64)
+    for i, frame in enumerate(fs.frames):
+        s = i * fs.hop_length
+        y[s: s + fs.frame_length] += frame
+        wsum[s: s + fs.frame_length] += fs.window
+    if weighted:
+        safe = np.where(np.abs(wsum) < 1e-6, 1.0, wsum)
+        y = y / safe
+    return y.astype(np.float32), wsum
+
+
+def window_overlap_profile(window: str, frame_length: int, hop_length: int, n_frames: int = 10) -> np.ndarray:
+    """Sum of shifted copies of a window — visualizes whether it satisfies
+    the constant-overlap-add (COLA) property at this hop size."""
+    win = sp_signal.get_window(window, frame_length, fftbins=True)
+    output_len = hop_length * (n_frames - 1) + frame_length
+    wsum = np.zeros(output_len)
+    for i in range(n_frames):
+        s = i * hop_length
+        wsum[s: s + frame_length] += win
+    return wsum
+
+
+def _autocorr_pitch_frame(frame: np.ndarray, sr: int, lag_min: int, lag_max: int) -> tuple[float, float]:
+    x = frame - np.mean(frame)
+    n = len(x)
+    lag_max_eff = min(lag_max, n - 1)
+    if lag_min >= lag_max_eff:
+        return 0.0, 0.0
+    ac = np.correlate(x, x, mode="full")
+    ac = ac[len(ac) // 2:]
+    if ac[0] <= 1e-9:
+        return 0.0, 0.0
+    lags = np.arange(lag_min, lag_max_eff + 1)
+    cross = ac[lag_min: lag_max_eff + 1]
+    # Normalize by the geometric mean of the two overlapping segments'
+    # energies (a normalized cross-correlation, NCCF) rather than by ac[0]:
+    # a raw dot-product's magnitude mechanically shrinks as lag grows (fewer
+    # samples overlap), which biases a plain argmax toward short lags/high
+    # frequencies regardless of periodicity.
+    x2 = x * x
+    cum_e = np.concatenate(([0.0], np.cumsum(x2)))
+    e_head = cum_e[n - lags]
+    e_tail = cum_e[n] - cum_e[lags]
+    denom = np.sqrt(e_head * e_tail)
+    scores = np.where(denom > 1e-9, cross / denom, 0.0)
+    peak = int(np.argmax(scores))
+    lag = lag_min + peak
+    f0 = sr / lag if lag > 0 else 0.0
+    conf = float(max(scores[peak], 0.0))
+    if peak == 0 or peak == len(scores) - 1:
+        # A peak sitting exactly at the edge of the search range usually
+        # means the search boundary won by default (no real periodicity was
+        # found in range), not that a genuine period lives right there --
+        # down-weight it instead of trusting it as a confident pitch.
+        conf *= 0.3
+    return f0, conf
+
+
+def _amdf_pitch_frame(frame: np.ndarray, sr: int, lag_min: int, lag_max: int) -> tuple[float, float]:
+    n = len(frame)
+    lag_max_eff = min(lag_max, n - 1)
+    if lag_min >= lag_max_eff:
+        return 0.0, 0.0
+    lags = np.arange(lag_min, lag_max_eff + 1)
+    amdf = np.array([np.mean(np.abs(frame[: n - lag] - frame[lag:])) for lag in lags])
+    orig_dip = int(np.argmin(amdf))
+    orig_lag = lag_min + orig_dip
+    # AMDF can lock onto an exact integer multiple of the true period -- its
+    # dip there can be *deeper* than at the true fundamental, especially when
+    # the true period isn't a whole number of samples (a multiple is more
+    # likely to land on an integer lag with near-zero residual). Prefer the
+    # shortest sub-multiple of the found lag whose dip is comparably deep.
+    best_lag = orig_lag
+    for k in (2, 3, 4, 5):
+        cand_lag = orig_lag // k
+        if cand_lag < lag_min:
+            break
+        cand_idx = cand_lag - lag_min
+        if amdf[cand_idx] <= amdf[orig_dip] * 1.1:
+            best_lag = cand_lag
+    dip = best_lag - lag_min
+    lag = lag_min + dip
+    f0 = sr / lag if lag > 0 else 0.0
+    ref = float(np.max(amdf)) if np.max(amdf) > 1e-9 else 1.0
+    conf = float(1.0 - amdf[dip] / ref)
+    if dip == 0 or dip == len(amdf) - 1:
+        conf *= 0.3
+    return f0, conf
+
+
+def _raw_frames(clip: AudioClip, frame_ms: float, overlap_pct: float) -> FrameSet:
+    # Pitch detectors need *unwindowed* frames: autocorrelation/AMDF are
+    # sensitive to the near-zero taper a Hamming/Hanning window puts at the
+    # frame edges, which otherwise biases them toward spuriously long lags.
+    return frame_signal(clip, frame_ms=frame_ms, overlap_pct=overlap_pct, window="boxcar")
+
+
+def pitch_autocorrelation(
+    clip: AudioClip, frame_ms: float = 20.0, overlap_pct: float = 50.0, fmin: float = 65.0, fmax: float = 400.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-frame F0 via the autocorrelation method: pick the lag (in the
+    plausible pitch-period range) with the highest autocorrelation peak."""
+    fs = _raw_frames(clip, frame_ms, overlap_pct)
+    lag_min, lag_max = max(int(fs.sr / fmax), 1), int(fs.sr / fmin)
+    out = [_autocorr_pitch_frame(f, fs.sr, lag_min, lag_max) for f in fs.frames]
+    f0 = np.array([o[0] for o in out], dtype=np.float32)
+    conf = np.array([o[1] for o in out], dtype=np.float32)
+    times = np.arange(len(f0)) * fs.hop_length / fs.sr
+    return times, f0, conf
+
+
+def pitch_amdf(
+    clip: AudioClip, frame_ms: float = 20.0, overlap_pct: float = 50.0, fmin: float = 65.0, fmax: float = 400.0
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-frame F0 via AMDF (Average Magnitude Difference Function): pick the
+    lag with the deepest dip (most similar shifted copy of the frame)."""
+    fs = _raw_frames(clip, frame_ms, overlap_pct)
+    lag_min, lag_max = max(int(fs.sr / fmax), 1), int(fs.sr / fmin)
+    out = [_amdf_pitch_frame(f, fs.sr, lag_min, lag_max) for f in fs.frames]
+    f0 = np.array([o[0] for o in out], dtype=np.float32)
+    conf = np.array([o[1] for o in out], dtype=np.float32)
+    times = np.arange(len(f0)) * fs.hop_length / fs.sr
+    return times, f0, conf
+
+
+def fix_octave_errors(f0: np.ndarray, conf: np.ndarray, conf_threshold: float = 0.3, ratio_tol: float = 0.12) -> np.ndarray:
+    """Mitigate isolated pitch doubling/halving: for each reliable frame, if
+    it disagrees by roughly a factor of 2 (or 1/2) with the GLOBAL median of
+    every reliable frame in the whole clip, snap it back onto that octave.
+
+    This median is a single whole-clip scalar, not a local/neighboring-frame
+    statistic -- it can misfire on a genuine sustained pitch excursion (e.g.
+    question intonation lasting many consecutive frames) that happens to sit
+    near 2x the clip's overall median, since nothing here distinguishes an
+    isolated single-frame artifact from a real, sustained contour change. It
+    is best suited to cleaning up occasional one-off octave slips, not to
+    tracking genuine pitch movement."""
+    fixed = f0.copy()
+    reliable = conf >= conf_threshold
+    if not np.any(reliable):
+        return fixed
+    med = float(np.median(fixed[reliable]))
+    if med <= 0:
+        return fixed
+    for i in range(len(fixed)):
+        if not reliable[i] or fixed[i] <= 0:
+            continue
+        ratio = fixed[i] / med
+        if abs(ratio - 2.0) < ratio_tol * 2:
+            fixed[i] /= 2.0
+        elif abs(ratio - 0.5) < ratio_tol * 0.5:
+            fixed[i] *= 2.0
+    return fixed
+
+
+def vad_frames(
+    clip: AudioClip,
+    frame_ms: float = 20.0,
+    overlap_pct: float = 50.0,
+    energy_margin_db: float = 12.0,
+    zcr_threshold: float = 0.20,
+    pitch_conf_threshold: float = 0.25,
+) -> dict:
+    """Rule-based voice activity detection using relative energy, pitch
+    reliability (autocorrelation confidence), and zero-crossing rate. A frame
+    counts as active speech if its energy clears a margin above the noise
+    floor AND it looks either voiced (a reliable pitch is detected) or like
+    an unvoiced consonant (energy above threshold but a noisy, high
+    zero-crossing rate rather than a periodic waveform)."""
+    fs = _raw_frames(clip, frame_ms, overlap_pct)
+    hop_length, frame_length = fs.hop_length, fs.frame_length
+    # center=False so these frames align exactly with the (also non-centered)
+    # frames pitch_autocorrelation uses. librosa's default center=True pads
+    # and centers each frame, which offsets it by half a frame from the raw
+    # frames used for pitch -- left uncorrected, every feature at index i
+    # would describe a different slice of audio, worst at exactly the
+    # speech/pause and voiced/unvoiced transitions VAD cares most about.
+    rms = librosa.feature.rms(y=clip.y, frame_length=frame_length, hop_length=hop_length, center=False)[0]
+    zcr = librosa.feature.zero_crossing_rate(
+        clip.y, frame_length=frame_length, hop_length=hop_length, center=False
+    )[0]
+    times = np.arange(len(rms)) * hop_length / clip.sr
+
+    rms_db = 20 * np.log10(np.maximum(rms, 1e-9))
+    noise_floor_db = float(np.percentile(rms_db, 10))
+    threshold_db = noise_floor_db + energy_margin_db
+
+    _, _, conf_ac = pitch_autocorrelation(clip, frame_ms=frame_ms, overlap_pct=overlap_pct)
+    n = min(len(times), len(zcr), len(conf_ac))
+    times, rms_db, zcr, conf_ac = times[:n], rms_db[:n], zcr[:n], conf_ac[:n]
+
+    relative_energy_db = rms_db - noise_floor_db
+    voiced_like = conf_ac >= pitch_conf_threshold
+    # Unvoiced consonants (s/f/sh, stops) are broadband and noise-like, which
+    # means a HIGH zero-crossing rate -- not low. Low ZCR marks periodic
+    # (voiced) content, already covered by voiced_like above.
+    unvoiced_like = zcr > zcr_threshold
+    active = (rms_db > threshold_db) & (voiced_like | unvoiced_like)
+    if len(active) >= 3:
+        active = sp_signal.medfilt(active.astype(int), kernel_size=3).astype(bool)
+
+    return {
+        "times": times,
+        "active": active,
+        "relative_energy_db": relative_energy_db,
+        "zcr": zcr,
+        "pitch_confidence": conf_ac,
+        "threshold_db": threshold_db,
+        "noise_floor_db": noise_floor_db,
+        "frame_length": frame_length,
+        "hop_length": hop_length,
+    }

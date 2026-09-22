@@ -19,14 +19,22 @@ from audio_core import (
     classify_segments,
     download_sample,
     download_url,
+    fix_octave_errors,
+    frame_signal,
     list_downloads,
     load_audio_bytes,
     load_audio_file,
     make_demo,
+    ola_reconstruct,
+    pitch_amdf,
+    pitch_autocorrelation,
     resample_clip,
+    save_clip_wav,
     synthesize_speech,
     to_wav_bytes,
     transcribe,
+    vad_frames,
+    window_overlap_profile,
 )
 
 INK = "#1C1916"
@@ -309,6 +317,94 @@ def plotly_spectrogram_fixed(clip: AudioClip, freq_range: float, title: str, hei
     return fig
 
 
+def plotly_window_sum(profile: np.ndarray, sr: int, hop_length: int, window_label: str) -> go.Figure:
+    times = np.arange(len(profile)) / sr
+    fig = _chart(f"윈도우 겹침 합 (COLA 확인) — {window_label}", 220, 0.0, float(times[-1]) if len(times) else 0.05)
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.add_scatter(
+        x=times, y=profile, mode="lines", line=dict(color=NAVY, width=1.2),
+        hovertemplate="%{x:.3f}초 · 합 %{y:.3f}<extra></extra>",
+    )
+    fig.update_yaxes(title="윈도우 합")
+    return fig
+
+
+def plotly_ola_compare(original: np.ndarray, reconstructed: np.ndarray, sr: int, title: str) -> go.Figure:
+    n = min(len(original), len(reconstructed))
+    t = np.arange(n) / sr
+    fig = _chart(title, 260, 0.0, float(t[-1]) if n else 0.05)
+    fig.add_scatter(x=t, y=original[:n], mode="lines", name="입력", line=dict(color=MUTED, width=1.0))
+    fig.add_scatter(x=t, y=reconstructed[:n], mode="lines", name="출력(재합성)", line=dict(color=NAVY, width=1.0))
+    fig.update_yaxes(title="진폭")
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    return fig
+
+
+def plotly_ola_error(original: np.ndarray, reconstructed: np.ndarray, sr: int) -> go.Figure:
+    n = min(len(original), len(reconstructed))
+    t = np.arange(n) / sr
+    err = original[:n] - reconstructed[:n]
+    fig = _chart("오차 (입력 − 출력)", 180, 0.0, float(t[-1]) if n else 0.05)
+    fig.add_scatter(x=t, y=err, mode="lines", line=dict(color="#A8481C", width=1.0))
+    fig.update_yaxes(title="오차")
+    return fig
+
+
+def plotly_pitch_compare(t_ac, f0_ac, conf_ac, t_amdf, f0_amdf, conf_amdf, conf_th: float) -> go.Figure:
+    f0_ac_masked = np.where(conf_ac >= conf_th, f0_ac, np.nan)
+    f0_amdf_masked = np.where(conf_amdf >= conf_th, f0_amdf, np.nan)
+    t_end = max(float(t_ac[-1]) if len(t_ac) else 0.05, float(t_amdf[-1]) if len(t_amdf) else 0.05)
+    fig = _chart("피치(F0) 비교: 자기상관 vs AMDF", 320, 0.0, t_end)
+    fig.add_scatter(x=t_ac, y=f0_ac_masked, mode="lines+markers", name="자기상관",
+                     line=dict(color=NAVY, width=1.6), marker=dict(size=3))
+    fig.add_scatter(x=t_amdf, y=f0_amdf_masked, mode="lines+markers", name="AMDF",
+                     line=dict(color="#C97A3B", width=1.6), marker=dict(size=3))
+    fig.update_yaxes(title="F0 (Hz)", range=[0, 420])
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    return fig
+
+
+def plotly_vad(clip: AudioClip, vad: dict) -> go.Figure:
+    fig = _chart("VAD 결과 (파형 + 음성 활성 구간)", 300, 0.0, max(clip.duration, 0.05))
+    times, active = vad["times"], vad["active"]
+    hop_s = vad["hop_length"] / clip.sr
+    in_run = False
+    run_start = 0.0
+    for i, a in enumerate(active):
+        if a and not in_run:
+            in_run, run_start = True, times[i] - hop_s / 2
+        elif not a and in_run:
+            in_run = False
+            fig.add_vrect(x0=max(0.0, run_start), x1=times[i] - hop_s / 2, fillcolor=NAVY, opacity=0.22, line_width=0)
+    if in_run:
+        fig.add_vrect(x0=max(0.0, run_start), x1=times[-1] + hop_s / 2, fillcolor=NAVY, opacity=0.22, line_width=0)
+    fig.add_scatter(
+        x=np.arange(len(clip.y)) / clip.sr, y=clip.y, mode="lines",
+        line=dict(color=INK, width=1.0), hovertemplate="%{x:.3f}초 · 진폭 %{y:.3f}<extra></extra>",
+    )
+    fig.update_yaxes(title="진폭")
+    fig.update_layout(showlegend=False)
+    return fig
+
+
+def plotly_vad_features(vad: dict) -> go.Figure:
+    times = vad["times"]
+    fig = _chart("VAD 특징: 상대 에너지 · ZCR · 피치 신뢰도", 260, 0.0, float(times[-1]) if len(times) else 0.05)
+    fig.add_scatter(x=times, y=vad["relative_energy_db"], mode="lines", name="상대 에너지(dB)",
+                     line=dict(color=NAVY, width=1.3))
+    fig.add_scatter(x=times, y=vad["pitch_confidence"] * 40, mode="lines", name="피치 신뢰도(×40, 참고용)",
+                     line=dict(color="#7A9A6B", width=1.0))
+    fig.add_scatter(x=times, y=vad["zcr"] * 100, mode="lines", name="ZCR(×100)", yaxis="y2",
+                     line=dict(color="#C97A3B", width=1.0))
+    fig.add_hline(y=vad["threshold_db"] - vad["noise_floor_db"], line=dict(color="#A8481C", width=1.0, dash="dash"))
+    fig.update_layout(
+        yaxis=dict(title="dB"),
+        yaxis2=dict(title="ZCR ×100", overlaying="y", side="right", showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
 def pick_clip():
     mode = st.selectbox(
         "방법",
@@ -402,6 +498,9 @@ def main() -> None:
     st.markdown('<div class="section"><h3>재생</h3>', unsafe_allow_html=True)
     render_stats(clip, stats)
     st.audio(to_wav_bytes(clip), format="audio/wav")
+    if st.button("이 음성을 downloads/ 폴더에 저장", width="stretch"):
+        saved_path = save_clip_wav(clip)
+        st.success(f"저장됨: downloads/{saved_path.name}")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="section"><h3>음성 인식 (STT, 로컬 Whisper)</h3>', unsafe_allow_html=True)
@@ -526,6 +625,94 @@ def main() -> None:
     st.caption(
         "에너지(RMS)가 잡음 바닥보다 충분히 높으면 발화 구간으로, 그중 피치(YIN)가 검출되거나 ZCR이 낮으면 유성음, "
         "그렇지 않으면 무성음으로 분류하는 간단한 규칙 기반 방법입니다. 위 설정을 조정해 경계를 다시 확인해 보세요."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section"><h3>단시간 분석·합성 (OLA)</h3>', unsafe_allow_html=True)
+    oc1, oc2, oc3 = st.columns(3)
+    with oc1:
+        ola_frame_ms = st.slider("프레임 길이 (ms)", 5.0, 50.0, 20.0, 1.0, key="ola_frame_ms")
+    with oc2:
+        ola_overlap_pct = st.slider("겹침 비율 (%)", 0.0, 90.0, 50.0, 5.0, key="ola_overlap_pct")
+    with oc3:
+        ola_window = st.selectbox("윈도우 종류", ["hamming", "hann", "boxcar", "blackman"], key="ola_window")
+    ola_weighted = st.checkbox("가중치 OLA (윈도우 합으로 정규화해 오차 보정)", value=True, key="ola_weighted")
+
+    fs = frame_signal(clip, frame_ms=ola_frame_ms, overlap_pct=ola_overlap_pct, window=ola_window)
+    recon, _ = ola_reconstruct(fs, weighted=ola_weighted)
+    profile = window_overlap_profile(ola_window, fs.frame_length, fs.hop_length, n_frames=20)
+
+    st.plotly_chart(plotly_window_sum(profile, clip.sr, fs.hop_length, ola_window), use_container_width=True, config=CHART_CONFIG)
+    st.caption(
+        f"프레임 {fs.frame_length}샘플({ola_frame_ms:.0f}ms), 이동 {fs.hop_length}샘플({ola_overlap_pct:.0f}% 겹침). "
+        "이 선이 평평할수록(값이 일정할수록) 겹쳐서 더했을 때 원신호를 그대로 복원하기 좋다는 뜻입니다 (COLA 조건). "
+        "50%나 75% 겹침에서는 hann/hamming 둘 다 평평하지만, 25%처럼 애매한 비율에서는 물결(리플)이 생기는 걸 확인해 보세요."
+    )
+    st.plotly_chart(plotly_ola_compare(clip.y, recon, clip.sr, "입력 대 재합성 출력 파형"), use_container_width=True, config=CHART_CONFIG)
+    st.plotly_chart(plotly_ola_error(clip.y, recon, clip.sr), use_container_width=True, config=CHART_CONFIG)
+
+    n_ola = min(len(clip.y), len(recon))
+    ola_err = clip.y[:n_ola].astype(np.float64) - recon[:n_ola].astype(np.float64)
+    rmse = float(np.sqrt(np.mean(ola_err ** 2))) if n_ola else 0.0
+    input_rms = float(np.sqrt(np.mean(clip.y[:n_ola].astype(np.float64) ** 2))) if n_ola else 0.0
+    rel_err_pct = 100 * rmse / input_rms if input_rms > 1e-12 else 0.0
+    st.caption(
+        f"재구성 오차(RMSE): {rmse:.5f} (입력 신호 크기 대비 {rel_err_pct:.2f}%). "
+        f"지금은 {'가중치 OLA 적용' if ola_weighted else '가중치 미적용(단순 덧셈)'} 상태입니다 — "
+        "체크박스를 꺼보면 (특히 겹침 비율이 애매할 때) 오차가 커지는 걸 비교할 수 있어요."
+    )
+    play_y = recon.astype(np.float32)
+    peak = float(np.max(np.abs(play_y))) if len(play_y) else 0.0
+    if peak > 1.0:
+        play_y = play_y / peak
+    st.audio(to_wav_bytes(AudioClip(y=play_y, sr=clip.sr, name="ola_recon.wav", channels=1)), format="audio/wav")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section"><h3>피치 추정: 자기상관 vs AMDF</h3>', unsafe_allow_html=True)
+    pc1, pc2, pc3 = st.columns(3)
+    with pc1:
+        pitch_frame_ms = st.slider("프레임 길이 (ms)", 10.0, 50.0, 20.0, 1.0, key="pitch_frame_ms")
+    with pc2:
+        pitch_overlap_pct = st.slider("겹침 비율 (%)", 0.0, 90.0, 50.0, 5.0, key="pitch_overlap_pct")
+    with pc3:
+        pitch_conf_th = st.slider("신뢰도 임계값", 0.0, 1.0, 0.3, 0.05, key="pitch_conf_th")
+    fix_octave = st.checkbox("옥타브 오류 보정 (피치 더블링/하빙 완화)", value=False, key="fix_octave")
+
+    t_ac, f0_ac, conf_ac = pitch_autocorrelation(clip, frame_ms=pitch_frame_ms, overlap_pct=pitch_overlap_pct)
+    t_amdf, f0_amdf, conf_amdf = pitch_amdf(clip, frame_ms=pitch_frame_ms, overlap_pct=pitch_overlap_pct)
+    if fix_octave:
+        f0_ac = fix_octave_errors(f0_ac, conf_ac)
+        f0_amdf = fix_octave_errors(f0_amdf, conf_amdf)
+
+    st.plotly_chart(
+        plotly_pitch_compare(t_ac, f0_ac, conf_ac, t_amdf, f0_amdf, conf_amdf, pitch_conf_th),
+        use_container_width=True, config=CHART_CONFIG,
+    )
+    rel_ac = conf_ac >= pitch_conf_th
+    rel_amdf = conf_amdf >= pitch_conf_th
+    med_ac = f"{np.median(f0_ac[rel_ac]):.0f} Hz" if rel_ac.any() else "—"
+    med_amdf = f"{np.median(f0_amdf[rel_amdf]):.0f} Hz" if rel_amdf.any() else "—"
+    st.caption(
+        f"자기상관: {int(rel_ac.sum())}/{len(conf_ac)} 프레임이 신뢰도 {pitch_conf_th:.2f} 이상 (중앙값 {med_ac}). "
+        f"AMDF: {int(rel_amdf.sum())}/{len(conf_amdf)} 프레임 (중앙값 {med_amdf}). "
+        "신뢰도 미달 구간은 그래프에서 끊겨서(빈 구간) 표시됩니다."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section"><h3>VAD (음성 활성 구간 검출)</h3>', unsafe_allow_html=True)
+    with st.expander("VAD 기준 설정", expanded=False):
+        vad_energy_margin = st.slider("에너지 임계값 여유 (dB, 잡음 바닥 대비)", 3.0, 30.0, 12.0, 1.0, key="vad_energy_margin")
+        vad_zcr_th = st.slider("무성음 판정 ZCR 임계값 (이보다 높으면 무성음 후보)", 0.02, 0.4, 0.20, 0.01, key="vad_zcr_th")
+        vad_conf_th = st.slider("피치 신뢰도 임계값", 0.0, 1.0, 0.25, 0.05, key="vad_conf_th")
+    vad = vad_frames(
+        clip, energy_margin_db=vad_energy_margin, zcr_threshold=vad_zcr_th, pitch_conf_threshold=vad_conf_th
+    )
+    st.plotly_chart(plotly_vad_features(vad), use_container_width=True, config=CHART_CONFIG)
+    st.plotly_chart(plotly_vad(clip, vad), use_container_width=True, config=CHART_CONFIG)
+    active_ratio = 100 * float(vad["active"].mean()) if len(vad["active"]) else 0.0
+    st.caption(
+        f"전체 프레임 중 {active_ratio:.0f}%가 음성 활성(active)으로 판정됨. "
+        "상대 에너지가 임계값을 넘으면서, 피치가 신뢰도 있게 검출되거나(유성음) ZCR이 높으면(무성음 자음 후보) 활성으로 판정하는 규칙 기반 VAD입니다."
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
