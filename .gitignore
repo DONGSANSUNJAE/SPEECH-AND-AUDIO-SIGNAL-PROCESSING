@@ -7,6 +7,7 @@ archive/
 build/
 dist/
 AudioLab.app/
+음성및오디오신호처리/
 *.mp3
 *.wav
 !demo_*.wav

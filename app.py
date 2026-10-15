@@ -24,6 +24,8 @@ from audio_core import (
     list_downloads,
     load_audio_bytes,
     load_audio_file,
+    lpc_analyze_frame,
+    lpc_spectrum,
     make_demo,
     ola_reconstruct,
     pitch_amdf,
@@ -405,6 +407,46 @@ def plotly_vad_features(vad: dict) -> go.Figure:
     return fig
 
 
+def plotly_lpc_signal_error(result) -> go.Figure:
+    t = np.arange(len(result.frame)) / result.sr
+    fig = _chart(f"LPC 분석 프레임: Signal x(n) vs Error e(n)  (P={result.order})", 260, 0.0, float(t[-1]) if len(t) else 0.05)
+    fig.add_scatter(x=t, y=result.frame, mode="lines", name="Signal x(n)", line=dict(color=MUTED, width=1.1))
+    fig.add_scatter(x=t, y=result.residual, mode="lines", name="Error e(n)", line=dict(color="#A8481C", width=1.1))
+    fig.update_yaxes(title="진폭")
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    return fig
+
+
+LPC_ORDER_COLORS = [NAVY, "#C97A3B", "#7A9A6B", "#A8481C", "#8B5FBF"]
+
+
+def plotly_lpc_spectrum_compare(frame: np.ndarray, sr: int, orders: list[int], highlight_order: int) -> go.Figure:
+    fig = _chart("신호 스펙트럼 vs LPC(AR) 스펙트럼 — 차수(P)별 비교", 420, 0, 1)
+    fig.update_layout(xaxis_rangeslider_visible=False, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    n = len(frame)
+    mag = 20 * np.log10(np.maximum(np.abs(np.fft.rfft(frame * np.hanning(n))), 1e-12))
+    mag -= np.max(mag)
+    freqs_fft = np.fft.rfftfreq(n, d=1 / sr)
+    fig.add_scatter(
+        x=freqs_fft, y=mag, mode="lines", name="신호 스펙트럼 (FFT)",
+        line=dict(color="#C9BFAE", width=1.4),
+        hovertemplate="%{x:.0f} Hz · %{y:.1f} dB<extra></extra>",
+    )
+    for i, p in enumerate(orders):
+        res_p = lpc_analyze_frame(frame, sr, p)
+        freqs, mag_db = lpc_spectrum(res_p)
+        mag_db = mag_db - np.max(mag_db)
+        is_hl = p == highlight_order
+        fig.add_scatter(
+            x=freqs, y=mag_db, mode="lines", name=f"LPC p={p}" + (" (선택)" if is_hl else ""),
+            line=dict(color=LPC_ORDER_COLORS[i % len(LPC_ORDER_COLORS)], width=2.6 if is_hl else 1.3),
+            hovertemplate=f"P={p} · " + "%{x:.0f} Hz · %{y:.1f} dB<extra></extra>",
+        )
+    fig.update_xaxes(title="주파수 (Hz)", range=[0, sr / 2])
+    fig.update_yaxes(title="크기 (dB, 각자 최대값 0dB 기준)")
+    return fig
+
+
 def pick_clip():
     mode = st.selectbox(
         "방법",
@@ -714,6 +756,49 @@ def main() -> None:
         f"전체 프레임 중 {active_ratio:.0f}%가 음성 활성(active)으로 판정됨. "
         "상대 에너지가 임계값을 넘으면서, 피치가 신뢰도 있게 검출되거나(유성음) ZCR이 높으면(무성음 자음 후보) 활성으로 판정하는 규칙 기반 VAD입니다."
     )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="section"><h3>LPC 분석 (Levinson-Durbin)</h3>', unsafe_allow_html=True)
+    lc1, lc2, lc3 = st.columns(3)
+    with lc1:
+        lpc_frame_ms = st.slider("프레임 길이 (ms)", 10.0, 50.0, 25.0, 1.0, key="lpc_frame_ms")
+    with lc2:
+        lpc_pos_s = st.slider(
+            "분석 위치 (초)", 0.0, duration, min(duration / 3, duration), 0.01, key="lpc_pos_s"
+        )
+    with lc3:
+        lpc_order = st.slider("LPC 차수 (P)", 2, 24, 14, 1, key="lpc_order")
+
+    frame_len = max(int(clip.sr * lpc_frame_ms / 1000), 8)
+    if len(clip.y) > frame_len:
+        start = max(0, min(int(lpc_pos_s * clip.sr), len(clip.y) - frame_len))
+    else:
+        start = 0
+    frame = clip.y[start:start + frame_len]
+    if len(frame) < frame_len:
+        frame = np.pad(frame, (0, frame_len - len(frame)))
+
+    lpc_result = lpc_analyze_frame(frame, clip.sr, lpc_order)
+    st.plotly_chart(plotly_lpc_signal_error(lpc_result), use_container_width=True, config=CHART_CONFIG)
+    st.caption(
+        "칠판 수식의 x(n) → [A(z)] → e(n) 과정 그대로입니다: 이 프레임(해밍 윈도우 적용)을 분석 필터 A(z)에 통과시켜 "
+        f"잔차 e(n)을 구한 것. 신호 표준편차 {np.std(lpc_result.frame):.4f} → 잔차 표준편차 {np.std(lpc_result.residual):.4f}로 "
+        "줄어든 만큼이 '예측 가능했던(=압축으로 아낄 수 있는) 정보'입니다."
+    )
+
+    compare_orders = sorted({o for o in (4, 8, 12, lpc_order) if 1 <= o <= 24})[:5]
+    st.plotly_chart(
+        plotly_lpc_spectrum_compare(frame, clip.sr, compare_orders, lpc_order),
+        use_container_width=True, config=CHART_CONFIG,
+    )
+    st.caption(
+        "회색 선은 실제 신호의 FFT 스펙트럼, 색선들은 차수(P)별 LPC(AR) 스펙트럼 — V(ω) = B/A(ω)를 dB로 그린 것입니다. "
+        "차수가 높아질수록 포먼트(공명 봉우리)를 더 세밀하게 따라가는 걸 볼 수 있어요."
+    )
+    with st.expander("반사계수(reflection coefficients) k_i 보기", expanded=False):
+        k_rows = "".join(f"<tr><td>k_{i + 1}</td><td>{k:.4f}</td></tr>" for i, k in enumerate(lpc_result.k))
+        st.markdown(f'<table class="stats"><tr><th>단계</th><th>값</th></tr>{k_rows}</table>', unsafe_allow_html=True)
+        st.caption("Levinson-Durbin 재귀의 각 단계에서 나오는 반사계수입니다. 전부 -1~1 사이에 있어야 필터가 안정적입니다.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 

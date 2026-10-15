@@ -828,3 +828,92 @@ def vad_frames(
         "frame_length": frame_length,
         "hop_length": hop_length,
     }
+
+
+# ---------------------------------------------------------------------------
+# LPC analysis via the Levinson-Durbin recursion
+#
+#   E(0) = phi[0]
+#   k_i  = { phi[i] - sum_{j=1}^{i-1} a_j^(i-1) phi[i-j] } / E(i-1),  1<=i<=P
+#   a_i^(i) = k_i
+#   a_j^(i) = a_j^(i-1) - k_i * a_{i-j}^(i-1),  1<=j<=i-1
+#   E(i) = (1 - k_i^2) E(i-1)
+#
+# matching the analysis/synthesis pair x(n) -> [A(z)] -> e(n) -> [1/A(z)] -> s^(n),
+# with the vocal-tract model V(z) = B / A(z), A(z) = 1 - sum_{k=1}^{P} a_k z^-k.
+# ---------------------------------------------------------------------------
+
+
+def autocorrelate_frame(frame: np.ndarray, max_lag: int) -> np.ndarray:
+    """Biased autocorrelation phi[0..max_lag] of a single (already-windowed) frame."""
+    n = len(frame)
+    max_lag = min(max_lag, n - 1)
+    return np.array([np.dot(frame[: n - lag], frame[lag:]) for lag in range(max_lag + 1)])
+
+
+def levinson_durbin(phi: np.ndarray, order: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Solve for LPC coefficients from an autocorrelation sequence phi[0..order]
+    via the Levinson-Durbin recursion (see the module-level derivation above).
+
+    Returns (a, k, E):
+      a -- LPC coefficients a[1..order] s.t. x[n] ~= sum_j a[j-1] * x[n-j]
+      k -- reflection (PARCOR) coefficients, one produced per recursion step
+      E -- prediction error energy E[0..order]; E[0] = phi[0], non-increasing
+    """
+    order = min(order, len(phi) - 1)
+    E = np.zeros(order + 1)
+    a = np.zeros(order + 1)  # a[0] unused (an implicit leading 1); a[1..order] returned
+    k = np.zeros(order + 1)  # k[0] unused
+    E[0] = phi[0]
+    if phi[0] <= 1e-12:
+        return a[1:], k[1:], E
+    for i in range(1, order + 1):
+        acc = phi[i] - float(np.dot(a[1:i], phi[i - 1:0:-1]))
+        k_i = acc / E[i - 1] if E[i - 1] > 1e-12 else 0.0
+        k_i = max(-0.999999, min(0.999999, k_i))  # keep the all-pole filter stable
+        a_prev = a.copy()
+        a[i] = k_i
+        for j in range(1, i):
+            a[j] = a_prev[j] - k_i * a_prev[i - j]
+        k[i] = k_i
+        E[i] = (1 - k_i ** 2) * E[i - 1]
+    return a[1:], k[1:], E
+
+
+@dataclass
+class LPCResult:
+    order: int
+    a: np.ndarray        # LPC coefficients a[1..P]
+    k: np.ndarray         # reflection coefficients
+    gain: float           # G = sqrt(final prediction error energy)
+    frame: np.ndarray     # the windowed analysis frame, x(n)
+    residual: np.ndarray  # e(n) = x(n) - sum a_k x(n-k), i.e. x(n) through A(z)
+    sr: int
+
+
+def lpc_analyze_frame(frame: np.ndarray, sr: int, order: int, window: str = "hamming") -> LPCResult:
+    """Classic autocorrelation-method LPC analysis of one frame: window it,
+    estimate its autocorrelation, run Levinson-Durbin, and compute the
+    residual e(n) by passing the frame through the analysis filter A(z)."""
+    n = len(frame)
+    win = np.ones(n) if window == "boxcar" else sp_signal.get_window(window, n, fftbins=True)
+    windowed = (frame * win).astype(np.float64)
+    phi = autocorrelate_frame(windowed, order)
+    a, k, E = levinson_durbin(phi, order)
+    gain = float(np.sqrt(max(E[-1], 0.0)))
+    b = np.concatenate(([1.0], -a))  # e(n) = x(n) - sum a_k x(n-k) is a pure FIR (MA) filter
+    residual = sp_signal.lfilter(b, [1.0], windowed)
+    return LPCResult(order=len(a), a=a, k=k, gain=gain, frame=windowed, residual=residual, sr=sr)
+
+
+def lpc_spectrum(result: LPCResult, n_freqs: int = 512) -> tuple[np.ndarray, np.ndarray]:
+    """The vocal-tract (AR) spectrum V(w) = G / A(e^jw), as 20*log10|V(w)| in dB,
+    matching the "LPC SPECTRUM" / "AR-spectrum" curves derived from V(z)=B/A(z)."""
+    w = np.linspace(0, np.pi, n_freqs)
+    A = np.ones(n_freqs, dtype=complex)
+    for idx, a_k in enumerate(result.a, start=1):
+        A -= a_k * np.exp(-1j * w * idx)
+    V = result.gain / A
+    freqs = w * result.sr / (2 * np.pi)
+    mag_db = 20 * np.log10(np.maximum(np.abs(V), 1e-12))
+    return freqs, mag_db
