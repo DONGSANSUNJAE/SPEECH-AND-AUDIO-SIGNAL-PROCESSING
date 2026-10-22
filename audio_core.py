@@ -917,3 +917,54 @@ def lpc_spectrum(result: LPCResult, n_freqs: int = 512) -> tuple[np.ndarray, np.
     freqs = w * result.sr / (2 * np.pi)
     mag_db = 20 * np.log10(np.maximum(np.abs(V), 1e-12))
     return freqs, mag_db
+
+
+def lpc_ola_signal(
+    clip: AudioClip,
+    order: int,
+    frame_ms: float = 25.0,
+    frame_shift_ms: float = 10.0,
+    window: str = "hamming",
+) -> dict:
+    """Run per-frame Levinson-Durbin LPC analysis across an entire clip -- i.e.
+    put the Levinson-Durbin recursion "inside" the OLA program -- and
+    reassemble the per-frame residuals e(n) and the per-frame
+    synthesis-filter reconstructions into two continuous signals via weighted
+    OLA. Reconstruction here applies 1/A(z) to each frame's OWN residual, so
+    it recovers the (windowed) input essentially exactly regardless of order
+    -- that only validates the analysis/synthesis pipeline is self-consistent,
+    it is not evidence that any one order reconstructs "better"; the
+    order-dependent quantity worth comparing is the residual energy (how much
+    the all-pole model whitens the frame), which is monotonically
+    non-increasing in order by construction of the recursion."""
+    overlap_pct = max(0.0, (1 - frame_shift_ms / frame_ms) * 100)
+    raw = frame_signal(clip, frame_ms=frame_ms, overlap_pct=overlap_pct, window="boxcar")
+    per_frame = [lpc_analyze_frame(f, clip.sr, order, window=window) for f in raw.frames]
+    win = sp_signal.get_window(window, raw.frame_length, fftbins=True) if raw.frame_length else np.array([])
+
+    if per_frame:
+        residual_stack = np.stack([r.residual for r in per_frame])
+        recon_frames = []
+        for r in per_frame:
+            a_full = np.concatenate(([1.0], -r.a))
+            recon_frames.append(sp_signal.lfilter([1.0], a_full, r.residual))
+        recon_stack = np.stack(recon_frames)
+    else:
+        residual_stack = np.zeros((0, raw.frame_length))
+        recon_stack = np.zeros((0, raw.frame_length))
+
+    residual_fs = FrameSet(frames=residual_stack, window=win, frame_length=raw.frame_length, hop_length=raw.hop_length, sr=clip.sr)
+    recon_fs = FrameSet(frames=recon_stack, window=win, frame_length=raw.frame_length, hop_length=raw.hop_length, sr=clip.sr)
+    residual_signal, _ = ola_reconstruct(residual_fs, weighted=True)
+    recon_signal, _ = ola_reconstruct(recon_fs, weighted=True)
+
+    gains = np.array([r.gain for r in per_frame])
+    return {
+        "per_frame": per_frame,
+        "residual_signal": residual_signal,
+        "recon_signal": recon_signal,
+        "frame_length": raw.frame_length,
+        "hop_length": raw.hop_length,
+        "overlap_pct": overlap_pct,
+        "mean_residual_energy": float(np.mean(gains ** 2)) if len(gains) else 0.0,
+    }
