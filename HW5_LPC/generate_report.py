@@ -256,7 +256,10 @@ def build_blocks(clip: ac.AudioClip, native_sr: int | None = None) -> list[Block
         "E(i) = (1−k_i²) E(i-1) is non-increasing by construction, so adding more poles can only reduce "
         "or leave unchanged the energy left in the residual, never increase it. The table and plot below show the "
         "mean residual energy, averaged over every frame in the recording, at each of the orders the assignment "
-        "specifies.", False))
+        "specifies. (This is φ[0]'s own scale -- a biased autocorrelation, i.e. a raw sum of squares over one "
+        f"{frame_len}-sample Hamming-windowed frame, not a per-sample power -- so it is only meaningful compared "
+        "across orders/frames on this same scale, not directly against a whole-clip RMS figure quoted elsewhere "
+        "in this report.)", False))
     b.append(("table",
         ["Order p", "Mean residual energy", "Reconstruction RMSE (sanity check)"],
         [[str(p), f"{e:.6f}", f"{r:.2e}"] for p, e, r in zip(ORDERS, order_energies, recon_rmses)]))
@@ -287,28 +290,53 @@ def build_blocks(clip: ac.AudioClip, native_sr: int | None = None) -> list[Block
         b.append(("picture", fig_ar_spectrum_frame(info["frame"], clip.sr, ORDERS, f"{labels_ko[key]} frame — AR spectrum vs. order"), 5.4))
 
     b.append(("subsection", "3.4 Findings"))
+    rep_stats = {}
+    for key, info in frames.items():
+        sig_energy = float(np.sum(info["frame"] ** 2))
+        ratio_low = ac.lpc_analyze_frame(info["frame"], clip.sr, 4).gain ** 2 / sig_energy
+        ratio_high = ac.lpc_analyze_frame(info["frame"], clip.sr, 20).gain ** 2 / sig_energy
+        rep_stats[key] = {"sig_energy": sig_energy, "ratio_low": ratio_low, "ratio_high": ratio_high}
+    if rep_stats:
+        b.append(("table",
+            ["Frame", "Signal energy (sum sq.)", "Residual/signal, p=4", "Residual/signal, p=20"],
+            [[labels_ko[k], f"{v['sig_energy']:.5f}", f"{v['ratio_low']*100:.1f}%", f"{v['ratio_high']*100:.1f}%"]
+             for k, v in rep_stats.items()]))
+
     if "voiced" in frames:
         voiced_peak_low = ar_peak_freq(frames["voiced"]["frame"], clip.sr, 20)
+        rv = rep_stats["voiced"]
         b.append(("body",
             f"On the voiced frame, raising the order progressively resolves separate formant peaks that low orders "
-            f"blur together into one broad bump; at p=20 the strongest AR peak sits at {voiced_peak_low:.0f} Hz. "
-            "Because voiced excitation is quasi-periodic, the raw FFT spectrum is a dense comb of harmonic lines; "
-            "the AR curve instead traces only the smooth formant envelope those harmonics sit under, which is "
-            "exactly the separation of \"what the vocal tract did\" from \"what the glottis did\" that motivates "
-            "LPC-based (vocoder) coding.", False))
+            f"blur together into one broad bump; at p=20 the strongest AR peak sits at {voiced_peak_low:.0f} Hz, and "
+            f"the residual/signal energy ratio falls from {rv['ratio_low']*100:.1f}% at p=4 to {rv['ratio_high']*100:.1f}% "
+            "at p=20 -- the largest order-dependent improvement of the three frame types, because there is real "
+            "formant structure for the extra poles to remove. Because voiced excitation is quasi-periodic, the raw "
+            "FFT spectrum is a dense comb of harmonic lines; the AR curve instead traces only the smooth formant "
+            "envelope those harmonics sit under, which is exactly the separation of \"what the vocal tract did\" "
+            "from \"what the glottis did\" that motivates LPC-based (vocoder) coding. This also matches the "
+            "lecture's own \"Criterion of Goodness\" property (p.55): the LP error criterion favors a good fit "
+            "near spectral peaks over spectral valleys, which is visible directly in the plot above -- each AR "
+            "curve tracks its FFT spectrum's peaks far more tightly than its valleys, at every order.", False))
     if "unvoiced" in frames:
+        ru = rep_stats["unvoiced"]
         b.append(("body",
-            "On the unvoiced frame, the FFT spectrum is comparatively flat and noise-like (no harmonic comb, "
-            "consistent with turbulent/frication excitation rather than periodic glottal pulses), and the AR "
-            "envelope stays broader and less sharply peaked than the voiced case at every order tested -- there is "
-            "less underlying spectral structure for extra poles to uncover, so the gap between low- and high-order "
-            "AR curves is visibly smaller here than for the voiced frame.", False))
+            f"On the unvoiced frame, the FFT spectrum is comparatively flat and noise-like (no harmonic comb, "
+            "consistent with turbulent/frication excitation rather than periodic glottal pulses), and the "
+            f"residual/signal ratio only falls from {ru['ratio_low']*100:.1f}% to {ru['ratio_high']*100:.1f}% "
+            "(p=4 to p=20) -- a visibly smaller improvement than the voiced frame's -- because there is less "
+            "underlying spectral structure for extra poles to uncover, so the gap between low- and high-order AR "
+            "curves is correspondingly smaller here than for the voiced frame.", False))
     if "background" in frames:
+        rb = rep_stats["background"]
+        rvv = rep_stats.get("voiced")
         b.append(("body",
-            "On the background/silence frame, both the FFT spectrum and the AR envelope are comparatively flat at "
-            "every order, and the frame's absolute residual energy is small in absolute terms despite there being "
-            "no real formant structure to recover -- the all-pole model is essentially fitting low-level noise, so "
-            "a low order is already sufficient and additional poles add no interpretable detail.", False))
+            f"On the background/silence frame, both the FFT spectrum and the AR envelope are comparatively flat at "
+            f"every order, and the residual/signal ratio is already low at p=4 ({rb['ratio_low']*100:.1f}%) and "
+            f"barely changes by p=20 ({rb['ratio_high']*100:.1f}%) -- additional poles add essentially no "
+            "interpretable detail. In absolute terms this frame's signal energy is "
+            + (f"about {rvv['sig_energy'] / rb['sig_energy']:.0f}× smaller than the voiced frame's" if rvv else "small")
+            + ", consistent with it containing near-silence rather than real formant structure for the all-pole "
+            "model to recover.", False))
 
     b.append(("section", "4. Consideration: Implementing LPC with Deep Learning"))
     b.append(("body",
@@ -328,9 +356,10 @@ def build_blocks(clip: ac.AudioClip, native_sr: int | None = None) -> list[Block
         "than pure prediction-error energy. Because the standard recursion is purely linear and closed-form, it "
         "cannot represent the mild nonlinearities (e.g. glottal-source/vocal-tract interaction, breathiness) real "
         "speech exhibits; a learned estimator could in principle fit those, at the cost of losing the closed-form "
-        "recursion's guaranteed filter stability (|k_i|<1), which would need to be re-imposed some other way (e.g. "
-        "predicting k_i through a tanh output, as is already done in the stability clamp used in this report's own "
-        "Levinson-Durbin implementation).", False))
+        "recursion's guaranteed filter stability (|k_i|<1), which would need to be re-imposed some other way -- for "
+        "instance a bounded output activation such as tanh, which enforces |k_i|<1 by construction, rather than "
+        "the hard min/max clamp this report's own Levinson-Durbin implementation uses to keep the recursion "
+        "numerically stable.", False))
 
     b.append(("section", "5. Summary"))
     b.append(("body",
