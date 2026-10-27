@@ -968,3 +968,92 @@ def lpc_ola_signal(
         "overlap_pct": overlap_pct,
         "mean_residual_energy": float(np.mean(gains ** 2)) if len(gains) else 0.0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Chapter 6: phase unwrapping (homomorphic / complex-cepstrum analysis)
+#
+#   Modulo-2pi unwrapper (discrete, "Recall" slide):
+#     r[0] = 0; for k > 0:
+#       S1: if  PV[X(k)] - PV[X(k-1)] >  2pi - eps  then r[k] = r[k-1] - 1
+#       S2: if  PV[X(k)] - PV[X(k-1)] < -(2pi - eps) then r[k] = r[k-1] + 1
+#       S3: otherwise                                    r[k] = r[k-1]
+#     angle X(k) = PV[X(k)] + 2*pi*r[k]
+#
+#   Phase-derivative-based unwrapper ("Phase Derivative-based Phase
+#   Unwrapper" slides): the continuous phase derivative d(angle X)/d(omega)
+#   has no 2pi jumps (only the principal value does), so integrating it
+#   (trapezoidal rule) from the already-unwrapped theta(w_{k-1}) predicts
+#   theta(w_k); the integer q(w_k) is then chosen to minimize
+#     E(k) = | (PV[X(w_k)] + 2*pi*q(w_k)) - theta_hat(w_k) |.
+# ---------------------------------------------------------------------------
+
+
+def phase_unwrap_modulo(phase: np.ndarray, eps: float = 0.1) -> np.ndarray:
+    """Discrete modulo-2pi phase unwrapper (Chapter6 p.8): given the
+    principal-value phase PV[X(k)] in (-pi, pi], find integer r[k] (r[0]=0)
+    so that PV[X(k)] + 2*pi*r[k] is continuous, by comparing each adjacent
+    jump against +-(2*pi - eps).
+
+    The slide's own note ("threshold eps? -> should be small enough") is a
+    real design trade-off, not a throwaway remark: a genuine wrap's raw
+    jump is 2*pi minus whatever the true phase actually moved between two
+    adjacent frequency samples (never exactly 2*pi), so eps must be LARGER
+    than that per-step drift or real wraps get silently missed -- e.g. for
+    a pure delay of D samples sampled at n_freqs points over [0, pi], the
+    per-step drift is about D*pi/n_freqs, and eps=1e-6 (an eps that is
+    itself extremely "small") fails to catch any wrap at all, while
+    eps=0.1 matches both np.unwrap and the analytic truth exactly. At the
+    same time eps must stay well below 2*pi so a large but genuine
+    (non-wrap) jump isn't mistaken for noise -- "small enough" means small
+    relative to 2*pi, not small in absolute terms."""
+    phase = np.asarray(phase, dtype=np.float64)
+    r = np.zeros(len(phase))
+    threshold = 2 * np.pi - eps
+    for k in range(1, len(phase)):
+        diff = phase[k] - phase[k - 1]
+        if diff > threshold:
+            r[k] = r[k - 1] - 1
+        elif diff < -threshold:
+            r[k] = r[k - 1] + 1
+        else:
+            r[k] = r[k - 1]
+    return phase + 2 * np.pi * r
+
+
+def _phase_and_derivative(x: np.ndarray, n_freqs: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """PV[X(w)] (principal value) and the continuous phase derivative
+    d(angle X)/d(omega), both over w in [0, pi]. The derivative is computed
+    analytically rather than by differencing the (wrapped) phase: if
+    x[n] <-> X(e^jw), then -j*n*x[n] <-> dX/dw, and
+    d(angle X)/dw = Im[ (dX/dw) / X(w) ] -- well-defined (no 2pi jump)
+    wherever X(w) != 0."""
+    n = len(x)
+    w = np.linspace(0, np.pi, n_freqs)
+    nn = np.arange(n)
+    # DTFT at arbitrary (non-FFT-grid) frequencies via direct summation --
+    # fine at these report sizes (n_freqs x n <= a few hundred thousand).
+    phase_mat = np.exp(-1j * np.outer(w, nn))
+    X = phase_mat @ x
+    dXdw = phase_mat @ (-1j * nn * x)
+    safe_X = np.where(np.abs(X) < 1e-12, 1e-12, X)
+    deriv = np.imag(dXdw / safe_X)
+    pv = np.angle(X)
+    return w, pv, deriv
+
+
+def phase_unwrap_derivative(x: np.ndarray, n_freqs: int = 512) -> dict:
+    """Phase-derivative-based phase unwrapper (Chapter6 p.9-10): combines the
+    principal value PV[X(w)] with the continuous phase derivative to predict
+    each next unwrapped value theta_hat(w_k) by trapezoidal integration of
+    the derivative from w_{k-1} to w_k, then picks the integer q(w_k) that
+    minimizes |PV[X(w_k)] + 2*pi*q(w_k) - theta_hat(w_k)| (equivalently,
+    rounds (theta_hat - PV) / (2*pi) to the nearest integer)."""
+    w, pv, deriv = _phase_and_derivative(x, n_freqs)
+    theta = np.zeros(n_freqs)
+    theta[0] = pv[0]
+    for k in range(1, n_freqs):
+        theta_hat = theta[k - 1] + (w[k] - w[k - 1]) / 2 * (deriv[k] + deriv[k - 1])
+        q = round((theta_hat - pv[k]) / (2 * np.pi))
+        theta[k] = pv[k] + 2 * np.pi * q
+    return {"freqs": w, "principal_value": pv, "derivative": deriv, "unwrapped": theta}
