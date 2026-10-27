@@ -25,9 +25,11 @@ from audio_core import (
     load_audio_bytes,
     load_audio_file,
     lpc_analyze_frame,
+    lpc_ola_signal,
     lpc_spectrum,
     make_demo,
     ola_reconstruct,
+    pick_representative_frames,
     pitch_amdf,
     pitch_autocorrelation,
     resample_clip,
@@ -447,6 +449,37 @@ def plotly_lpc_spectrum_compare(frame: np.ndarray, sr: int, orders: list[int], h
     return fig
 
 
+def plotly_lpc_full_residual(clip: AudioClip, pipeline: dict, order: int) -> go.Figure:
+    n = min(len(clip.y), len(pipeline["residual_signal"]))
+    t = np.arange(n) / clip.sr
+    fig = _chart(f"전체 신호: Input x(n) vs Residual e(n)  (P={order}, 녹음 전체에 OLA 적용)", 300, 0.0, float(t[-1]) if n else 0.05)
+    fig.add_scatter(x=t, y=clip.y[:n], mode="lines", name="Input x(n)", line=dict(color=MUTED, width=0.7))
+    fig.add_scatter(x=t, y=pipeline["residual_signal"][:n], mode="lines", name="Residual e(n)", line=dict(color="#A8481C", width=0.7))
+    fig.update_yaxes(title="진폭")
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    return fig
+
+
+def plotly_lpc_full_recon(clip: AudioClip, pipeline: dict, order: int) -> go.Figure:
+    n = min(len(clip.y), len(pipeline["recon_signal"]))
+    t = np.arange(n) / clip.sr
+    fig = _chart(f"전체 신호: Input vs 복원 신호 1/A(z)  (P={order})", 300, 0.0, float(t[-1]) if n else 0.05)
+    fig.add_scatter(x=t, y=clip.y[:n], mode="lines", name="Input x(n)", line=dict(color=NAVY, width=1.3))
+    fig.add_scatter(x=t, y=pipeline["recon_signal"][:n], mode="lines", name="복원 x̂(n)", line=dict(color="#C97A3B", width=0.8, dash="dash"))
+    fig.update_yaxes(title="진폭")
+    fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    return fig
+
+
+def plotly_lpc_order_energy(orders: list[int], energies: list[float]) -> go.Figure:
+    fig = _chart("Order별 평균 Residual Energy (화이트닝 효과)", 300, 0, 1)
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    fig.add_scatter(x=orders, y=energies, mode="lines+markers", line=dict(color=NAVY, width=2.0), marker=dict(size=8))
+    fig.update_xaxes(title="LPC 차수 (P)", range=[min(orders) - 1, max(orders) + 1], tickmode="array", tickvals=orders)
+    fig.update_yaxes(title="평균 Residual Energy")
+    return fig
+
+
 def pick_clip():
     mode = st.selectbox(
         "방법",
@@ -799,6 +832,34 @@ def main() -> None:
         k_rows = "".join(f"<tr><td>k_{i + 1}</td><td>{k:.4f}</td></tr>" for i, k in enumerate(lpc_result.k))
         st.markdown(f'<table class="stats"><tr><th>단계</th><th>값</th></tr>{k_rows}</table>', unsafe_allow_html=True)
         st.caption("Levinson-Durbin 재귀의 각 단계에서 나오는 반사계수입니다. 전부 -1~1 사이에 있어야 필터가 안정적입니다.")
+
+    st.markdown("#### 전체 신호 분석 (Homework #5 스펙: 8 kHz · 프레임 25 ms · shift 10 ms)", unsafe_allow_html=True)
+    hw_clip = resample_clip(clip, 8000) if clip.sr != 8000 else clip
+    hw_orders = [4, 8, 12, 16, 20]
+    pipeline = lpc_ola_signal(hw_clip, order=lpc_order, frame_ms=25.0, frame_shift_ms=10.0)
+    st.plotly_chart(plotly_lpc_full_residual(hw_clip, pipeline, lpc_order), use_container_width=True, config=CHART_CONFIG)
+    st.plotly_chart(plotly_lpc_full_recon(hw_clip, pipeline, lpc_order), use_container_width=True, config=CHART_CONFIG)
+    st.caption(
+        f"위 LPC 차수(P={lpc_order}) 슬라이더 값으로, 8kHz로 변환한 녹음 전체를 25ms/10ms OLA로 프레임마다 분석-합성한 결과입니다. "
+        "복원 신호는 각 프레임 자신의 residual을 그대로 역필터에 넣은 것이라 order와 무관하게 거의 완벽히 겹칩니다 — "
+        "이건 파이프라인이 제대로 연결됐다는 확인일 뿐, order가 좋다는 증거는 아닙니다."
+    )
+
+    order_energies = [lpc_ola_signal(hw_clip, order=p, frame_ms=25.0, frame_shift_ms=10.0)["mean_residual_energy"] for p in hw_orders]
+    st.plotly_chart(plotly_lpc_order_energy(hw_orders, order_energies), use_container_width=True, config=CHART_CONFIG)
+    st.caption("order가 커질수록 residual 에너지(화이트닝 정도)는 단조 감소하지만, 일정 order 이후로는 감소폭이 줄어듭니다 (diminishing returns).")
+
+    rep_frames = pick_representative_frames(hw_clip, frame_length=200)
+    rep_labels = {"voiced": "유성음(voiced)", "unvoiced": "무성음(unvoiced)", "background": "배경(background)"}
+    for key, label in rep_labels.items():
+        if key not in rep_frames:
+            continue
+        info = rep_frames[key]
+        st.plotly_chart(
+            plotly_lpc_spectrum_compare(info["frame"], hw_clip.sr, hw_orders, lpc_order),
+            use_container_width=True, config=CHART_CONFIG,
+        )
+        st.caption(f"{label} 프레임 — Homework #2 분류기로 자동 선택 (가장 긴 구간, {info['duration']:.2f}s, t={info['t_center']:.2f}s).")
     st.markdown("</div>", unsafe_allow_html=True)
 
 

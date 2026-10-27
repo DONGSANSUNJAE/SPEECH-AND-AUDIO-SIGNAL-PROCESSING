@@ -970,6 +970,37 @@ def lpc_ola_signal(
     }
 
 
+def extract_frame(clip: AudioClip, t_center: float, frame_length: int) -> np.ndarray:
+    """A single raw (unwindowed) frame_length-sample frame centered on t_center seconds."""
+    start = max(0, min(int(round(t_center * clip.sr)) - frame_length // 2, len(clip.y) - frame_length))
+    start = max(0, start)
+    f = clip.y[start: start + frame_length]
+    if len(f) < frame_length:
+        f = np.pad(f, (0, frame_length - len(f)))
+    return f.astype(np.float64)
+
+
+def pick_representative_frames(clip: AudioClip, frame_length: int) -> dict:
+    """The longest voiced/unvoiced/background segment's center frame, via the
+    Homework #2 classify_segments() classifier -- a reproducible way to pick
+    frames "of different characteristics" (e.g. for an LPC/AR-spectrum demo)
+    without picking them by eye."""
+    _, _, segments, _ = classify_segments(clip)
+    picks: dict = {}
+    for code, key in [(2, "voiced"), (1, "unvoiced"), (0, "background")]:
+        segs = [s for s in segments if s.code == code]
+        if not segs:
+            continue
+        longest = max(segs, key=lambda s: s.end - s.start)
+        mid = (longest.start + longest.end) / 2
+        picks[key] = {
+            "t_center": mid,
+            "duration": longest.end - longest.start,
+            "frame": extract_frame(clip, mid, frame_length),
+        }
+    return picks
+
+
 # ---------------------------------------------------------------------------
 # Chapter 6: phase unwrapping (homomorphic / complex-cepstrum analysis)
 #

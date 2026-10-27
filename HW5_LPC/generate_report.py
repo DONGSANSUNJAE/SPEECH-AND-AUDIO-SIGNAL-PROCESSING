@@ -110,27 +110,8 @@ def fig_to_png_bytes(fig) -> bytes:
 
 Block = tuple
 
-
-def extract_frame(clip: ac.AudioClip, t_center: float, frame_len: int) -> np.ndarray:
-    start = max(0, min(int(round(t_center * clip.sr)) - frame_len // 2, len(clip.y) - frame_len))
-    start = max(0, start)
-    f = clip.y[start: start + frame_len]
-    if len(f) < frame_len:
-        f = np.pad(f, (0, frame_len - len(f)))
-    return f.astype(np.float64)
-
-
-def pick_representative_frames(clip: ac.AudioClip, frame_len: int) -> dict:
-    _, _, segments, _ = ac.classify_segments(clip)
-    picks = {}
-    for code, key in [(2, "voiced"), (1, "unvoiced"), (0, "background")]:
-        segs = [s for s in segments if s.code == code]
-        if not segs:
-            continue
-        longest = max(segs, key=lambda s: s.end - s.start)
-        mid = (longest.start + longest.end) / 2
-        picks[key] = {"t_center": mid, "duration": longest.end - longest.start, "frame": extract_frame(clip, mid, frame_len)}
-    return picks
+# extract_frame / pick_representative_frames now live in audio_core.py
+# (shared with app.py's LPC demo section).
 
 
 def fig_signal_residual_recon(clip: ac.AudioClip, pipeline: dict) -> bytes:
@@ -205,7 +186,7 @@ def build_blocks(clip: ac.AudioClip, native_sr: int | None = None) -> list[Block
     primary_pipeline = ac.lpc_ola_signal(clip, order=PRIMARY_ORDER, frame_ms=FRAME_MS, frame_shift_ms=FRAME_SHIFT_MS)
     hop_len = primary_pipeline["hop_length"]
 
-    frames = pick_representative_frames(clip, frame_len)
+    frames = ac.pick_representative_frames(clip, frame_len)
 
     b.append(("title", COURSE_TITLE))
     b.append(("id_line", f"{STUDENT_ID} {STUDENT_NAME}"))
